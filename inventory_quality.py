@@ -57,6 +57,21 @@ def check(data):
             if not f.get('gwpversion'): result.append('缺少 GWP 版本')
             if not f.get('gas') or f.get('gas') == 'CO₂e': result.append('應指定實際溫室氣體')
         return result
+    assessments = data.get('assessments', [])
+    year = str(settings.get('year', ''))
+    for source in sources:
+        if source.get('cat') in (3, 4, 5, 6) and not any(x.get('sourceId') == source.get('id') and str(x.get('year', '')) == year for x in assessments):
+            issue('提醒', '顯著性評估', source.get('name') or source.get('id'), '本年度尚未記錄顯著性評估')
+    for a in assessments:
+        if not a.get('method') or not a.get('reason') or not a.get('assessor') or a.get('decision') not in ('重大', '非重大'):
+            issue('提醒', '顯著性評估', a.get('id'), '評估標準、人員、判定或理由尚不完整')
+        if not any(x.get('id') == a.get('sourceId') for x in sources):
+            issue('提醒', '顯著性評估', a.get('id'), '關聯排放源不存在，請核對歷史評估')
+        scores, threshold = a.get('scores'), a.get('threshold')
+        if not isinstance(scores, list) or len(scores) != 4 or any(not isinstance(x, int) or isinstance(x, bool) or x < 1 or x > 5 for x in scores) or not isinstance(threshold, int) or isinstance(threshold, bool) or not 4 <= threshold <= 20:
+            issue('錯誤', '顯著性評估', a.get('id'), '分數或門檻不正確')
+        elif a.get('total') != sum(scores) or a.get('suggested') != ('重大' if sum(scores) >= threshold else '非重大'):
+            issue('錯誤', '顯著性評估', a.get('id'), '總分或門檻結果與各項分數不一致')
     for f in factors:
         for detail in factor_issues(f): issue('錯誤', '排放係數', f.get('name') or f.get('id'), detail)
     for r in records:

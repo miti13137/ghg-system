@@ -21,6 +21,7 @@ DB = DATA / "inventory.sqlite3"
 TOKEN = secrets.token_urlsafe(32)
 BACKUPS = DATA / "backups"
 KEYS = ("sources", "factors", "records", "evidence", "audit")
+OPTIONAL_KEYS = ("assessments",)
 
 def connect():
     con = sqlite3.connect(DB)
@@ -35,6 +36,9 @@ def validate(data):
     for key in KEYS:
         if not isinstance(data.get(key), list) or any(not isinstance(x, dict) for x in data[key]):
             raise ValueError("Invalid inventory collection: " + key)
+    for key in OPTIONAL_KEYS:
+        if key in data and (not isinstance(data[key], list) or any(not isinstance(x, dict) for x in data[key])):
+            raise ValueError("Invalid optional collection: " + key)
     return json.dumps(data, ensure_ascii=False, allow_nan=False)
 
 def revision(payload):
@@ -75,7 +79,7 @@ def change_events(previous, payload, reason):
                        json.dumps(after, ensure_ascii=False) if after is not None else None, reason))
     if old.get("settings") != new.get("settings"):
         add("修改", "settings", "settings", old.get("settings"), new.get("settings"))
-    for collection in KEYS:
+    for collection in KEYS + OPTIONAL_KEYS:
         before_list, after_list = old.get(collection, []), new.get(collection, [])
         def index(items):
             mapping = {}

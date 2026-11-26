@@ -186,6 +186,19 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(any('月份格式' in item['message'] for item in json.loads(data)))
         self.assertEqual(self.request('GET', '/api/quality', headers={'X-GHG-Token':'bad'})[0], 404)
 
+    def test_optional_assessment_legacy_and_history(self):
+        _, hdr, _ = self.request('GET', '/api/inventory')
+        status, hdr, _ = self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': hdr['X-GHG-Revision']})
+        self.assertEqual(status, 200)
+        self.data['assessments'] = [{'id':'a1','sourceId':'s1','year':2025,'total':14,'threshold':12,'decision':'重大','method':'模擬方法','assessor':'模擬人員','reason':'模擬理由'}]
+        status, hdr, _ = self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': hdr['X-GHG-Revision']})
+        self.assertEqual(status, 200)
+        history = json.loads(self.request('GET', '/api/history')[2])
+        self.assertTrue(any(x['collection'] == 'assessments' and x['operation'] == '新增' for x in history))
+        self.assertEqual(json.loads(self.request('GET', '/api/inventory')[2])['assessments'][0]['total'], 14)
+        self.data['assessments'] = 'invalid'
+        self.assertEqual(self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': hdr['X-GHG-Revision']})[0], 400)
+
     def test_offline_excel_endpoints(self):
         matrix = [['名稱', '數值'], ['模擬資料', '12']]
         status, headers, workbook = self.request('POST', '/api/xlsx/write', json.dumps(matrix).encode())

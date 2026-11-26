@@ -37,6 +37,15 @@ class QualityTests(unittest.TestCase):
         self.assertTrue(any('有效非負數' in e['message'] for e in found))
         self.assertTrue(any('重複' in e['message'] for e in found))
         self.assertTrue(any('佐證' in e['message'] for e in found))
+    def test_indirect_assessment_missing_and_present(self):
+        self.data['settings']['year'] = 2025
+        self.source['cat'] = 3
+        issues = inventory_quality.check(self.data)
+        self.assertTrue(any(x['group'] == '顯著性評估' and '尚未記錄' in x['message'] for x in issues))
+        self.data['assessments'] = [{'id':'a1','sourceId':'s1','year':2025,'method':'模擬','reason':'模擬','assessor':'測試','decision':'重大','scores':[4,4,4,4],'threshold':12,'total':16,'suggested':'重大'}]
+        issues = inventory_quality.check(self.data)
+        self.assertFalse(any(x['group'] == '顯著性評估' for x in issues))
+
     def test_tco2e(self):
         self.record['factorSnapshot'].update(type='tco2e',value=0.002)
         self.record['amount']=0.2
