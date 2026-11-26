@@ -12,6 +12,7 @@ import webbrowser
 import xlsx_local
 import inventory_quality
 from annual_report import annual_report
+from inventory_years import annual_totals, validate_year_settings
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -22,7 +23,7 @@ DB = DATA / "inventory.sqlite3"
 TOKEN = secrets.token_urlsafe(32)
 BACKUPS = DATA / "backups"
 KEYS = ("sources", "factors", "records", "evidence", "audit")
-OPTIONAL_KEYS = ("assessments",)
+OPTIONAL_KEYS = ("assessments", "yearSettings")
 
 def connect():
     con = sqlite3.connect(DB)
@@ -40,6 +41,7 @@ def validate(data):
     for key in OPTIONAL_KEYS:
         if key in data and (not isinstance(data[key], list) or any(not isinstance(x, dict) for x in data[key])):
             raise ValueError("Invalid optional collection: " + key)
+    validate_year_settings(data.get("yearSettings", []))
     return json.dumps(data, ensure_ascii=False, allow_nan=False)
 
 def revision(payload):
@@ -190,6 +192,11 @@ const localStore = {
             if hashlib.sha256(row[0]).hexdigest() != row[1]:
                 return self.reply(500, b'{"error":"integrity"}')
             return self.reply(200, row[0], "application/octet-stream")
+        if self.path == "/api/annual-totals" and self.headers.get("X-GHG-Token") == TOKEN:
+            with connect() as con:
+                row = con.execute("SELECT payload FROM inventory WHERE id=1").fetchone()
+            totals = annual_totals(json.loads(row[0])) if row else []
+            return self.reply(200, json.dumps(totals, ensure_ascii=False).encode("utf-8"))
         report = re.fullmatch(r"/api/report/([0-9]{4})", self.path)
         if report and self.headers.get("X-GHG-Token") == TOKEN:
             with connect() as con:

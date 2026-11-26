@@ -223,6 +223,34 @@ class StorageTests(unittest.TestCase):
         self.assertNotIn('前年度不應出現', html)
         self.assertEqual(self.request('GET', '/api/report/2026', headers={'X-GHG-Token': 'bad'})[0], 404)
 
+    def test_year_boundaries_and_totals_are_isolated(self):
+        self.data['settings'] = {'year': 2026, 'company': '本年度甲公司'}
+        self.data['yearSettings'] = [
+            {'id': '2025', 'company': '舊年度乙公司', 'boundary': '股權比例法', 'sites': '測試廠'},
+            {'id': '2024', 'company': '無活動資料年度'},
+        ]
+        self.data['records'] = [
+            {'month': '2025-01', 'sourceSnapshot': {'cat': 2}, 'amount': 0, 'status': '已審核'},
+            {'month': '2026-02', 'sourceSnapshot': {'cat': 3}, 'amount': 1.25},
+            {'month': '2026-03', 'amount': 100},
+        ]
+        _, headers, _ = self.request('GET', '/api/inventory')
+        status, headers, _ = self.request('PUT', '/api/inventory', json.dumps(self.data),
+                                         {'X-GHG-Revision': headers['X-GHG-Revision']})
+        self.assertEqual(status, 200)
+        old_report = self.request('GET', '/api/report/2025')[2].decode()
+        self.assertIn('舊年度乙公司', old_report)
+        self.assertNotIn('本年度甲公司', old_report)
+        unconfigured = self.request('GET', '/api/report/2023')[2].decode()
+        self.assertIn('尚未填寫完整', unconfigured)
+        self.assertNotIn('本年度甲公司', unconfigured)
+        rows = json.loads(self.request('GET', '/api/annual-totals')[2])
+        self.assertEqual([(r['year'], r['total'], r['pending'], r['invalid']) for r in rows],
+                         [('2024', None, 0, 0), ('2025', '0.0', 0, 0), ('2026', '1.25', 2, 1)])
+        self.data['yearSettings'].append({'id': '2025'})
+        self.assertEqual(self.request('PUT', '/api/inventory', json.dumps(self.data),
+                         {'X-GHG-Revision': headers['X-GHG-Revision']})[0], 400)
+
     def test_offline_excel_endpoints(self):
         matrix = [['名稱', '數值'], ['模擬資料', '12']]
         status, headers, workbook = self.request('POST', '/api/xlsx/write', json.dumps(matrix).encode())

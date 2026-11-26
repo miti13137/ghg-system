@@ -4,6 +4,7 @@ from html import escape
 import re
 
 from inventory_quality import numeric
+from inventory_years import settings_for_year
 
 CATEGORIES = (
     '直接排放', '輸入能源間接排放', '運輸間接排放',
@@ -21,7 +22,7 @@ def table(headers, rows):
 
 
 def annual_report(data, year):
-    settings = data['settings']
+    settings = settings_for_year(data, year)
     records = [r for r in data['records'] if re.fullmatch(year + r'-(0[1-9]|1[0-2])', str(r.get('month', '')))]
     evidence = {}
     for item in data['evidence']:
@@ -58,6 +59,7 @@ def annual_report(data, year):
         not re.fullmatch(r'[0-9]{4}-(0[1-9]|1[0-2])', str(r.get('month', '')))
         for r in data['records']
     )
+    boundary_notice = '' if settings.get('company') and settings.get('boundary') and settings.get('sites') else '<p>本年度的組織邊界資料尚未填寫完整。</p>'
     boundaries = table(('項目', '內容'), [
         ('公司', settings.get('company')), ('邊界方法', settings.get('boundary')),
         ('廠區', settings.get('sites')), ('負責人', settings.get('owner')),
@@ -89,7 +91,7 @@ th{{background:#eaf3f0}} .scroll{{overflow-x:auto}} .items{{font-size:.8rem}}
 .items{{table-layout:fixed;font-size:7pt}}thead{{display:table-header-group}}tr{{break-inside:avoid}}}}
 </style><h1>{year} 年溫室氣體盤查報告草稿</h1>
 <p>資料來源為本機已儲存的盤查資料。彙總含未審核紀錄，發布前請核對資料品質、報告邊界及計算依據。</p>
-<h2>組織與盤查邊界</h2>{boundaries}
+<h2>組織與盤查邊界</h2>{boundary_notice}{boundaries}
 <h2>年度排放彙總</h2><p>可彙總排放量 {total_text}，活動紀錄 {len(records)} 筆，未審核 {pending} 筆。
 本年度有 {incomplete} 筆因類別或排放量無效而未計入合計。全資料庫另有 {invalid_months} 筆月份無效，無法歸入年度。</p>{summary}
 <h2>間接排放顯著性評估</h2>{assessments}
