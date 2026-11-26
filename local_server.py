@@ -2,6 +2,7 @@
 import json
 import hashlib
 import time
+import re
 import os
 import sqlite3
 import secrets
@@ -70,6 +71,12 @@ class Handler(BaseHTTPRequestHandler):
     def allowed(self):
         return self.headers.get("Host") == "127.0.0.1:" + str(self.server.server_port)
 
+    def backup_names(self):
+        if not BACKUPS.exists():
+            return []
+        pattern = re.compile(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{8}\.sqlite3")
+        return sorted((p.name for p in BACKUPS.iterdir() if pattern.fullmatch(p.name) and p.is_file() and not p.is_symlink()), reverse=True)
+
     def do_GET(self):
         if not self.allowed():
             return self.reply(403, b"{}")
@@ -102,6 +109,8 @@ const localStore = {
             html = html.replace("目前仍使用本機瀏覽器儲存", "目前使用本機 SQLite 儲存")
             html = html.replace("catch{db=fresh()}", "catch(e){document.body.textContent='資料庫讀取失敗，請勿繼續操作。';throw e}")
             return self.reply(200, html.encode(), "text/html; charset=utf-8")
+        if self.path == "/api/backups" and self.headers.get("X-GHG-Token") == TOKEN:
+            return self.reply(200, json.dumps(self.backup_names()).encode("utf-8"))
         if self.path == "/api/inventory" and self.headers.get("X-GHG-Token") == TOKEN:
             with connect() as con:
                 row = con.execute("SELECT payload FROM inventory WHERE id=1").fetchone()
@@ -110,6 +119,8 @@ const localStore = {
         return self.reply(404, b"{}")
 
     def do_POST(self):
+        if self.allowed() and self.headers.get("X-GHG-Token") == TOKEN and self.path in ("/api/backups/create", "/api/backups/restore"):
+            return self.backup_action()
         if not self.allowed() or self.headers.get("X-GHG-Token") != TOKEN or self.path not in ("/api/xlsx/read", "/api/xlsx/write"):
             return self.reply(403, b"{}")
         try:
@@ -124,6 +135,42 @@ const localStore = {
             body = xlsx_local.write_xlsx(matrix)
             return self.reply(200, body, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         except (ValueError, TypeError, OSError, OverflowError) as e:
+            return self.reply(400, json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
+
+    def backup_action(self):
+        try:
+            with connect() as con:
+                row = con.execute("SELECT payload FROM inventory WHERE id=1").fetchone()
+                previous = row[0] if row else None
+                if previous is None:
+                    raise ValueError("目前沒有可備份的資料")
+                if self.headers.get("X-GHG-Revision") != revision(previous):
+                    return self.reply(409, b'{"error":"stale revision"}')
+                if self.path == "/api/backups/create":
+                    backup_database(con)
+                    self.response_revision = revision(previous)
+                    return self.reply(200, b"{}")
+                size = int(self.headers.get("Content-Length", "0"))
+                if not 0 < size <= 1024:
+                    raise ValueError("備份名稱不正確")
+                obj = json.loads(self.rfile.read(size))
+                name = obj.get("name") if isinstance(obj, dict) else None
+                if not isinstance(name, str) or name not in self.backup_names():
+                    raise ValueError("找不到選取的備份")
+                path = BACKUPS / name
+                # Read the selected file before creating another backup, which may rotate older files.
+                with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as source:
+                    if source.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                        raise ValueError("備份資料庫檢查失敗")
+                    saved = source.execute("SELECT payload FROM inventory WHERE id=1").fetchone()
+                    if not saved or len(saved[0]) > 50_000_000:
+                        raise ValueError("備份內容不正確")
+                    payload = validate(json.loads(saved[0]))
+                backup_database(con)
+                con.execute("UPDATE inventory SET payload=? WHERE id=1", (payload,))
+            self.response_revision = revision(payload)
+            return self.reply(200, b"{}")
+        except (ValueError, TypeError, sqlite3.Error, OSError, OverflowError) as e:
             return self.reply(400, json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
 
     def do_PUT(self):

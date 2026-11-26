@@ -62,6 +62,38 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(previous['settings'], {'year': 2026})
             self.assertEqual(con.execute('pragma integrity_check').fetchone()[0], 'ok')
 
+    def test_backup_list_restore_and_stale_rejection(self):
+        _, hdr, _ = self.request('GET', '/api/inventory')
+        initial = hdr['X-GHG-Revision']
+        status, hdr, _ = self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': initial})
+        self.assertEqual(status, 200)
+        v1 = hdr['X-GHG-Revision']
+        status, _, _ = self.request('POST', '/api/backups/create', headers={'X-GHG-Revision': v1})
+        self.assertEqual(status, 200)
+        status, _, raw = self.request('GET', '/api/backups')
+        self.assertEqual(status, 200)
+        name = json.loads(raw)[0]
+        self.data['settings']['company'] = '模擬第二版'
+        status, hdr, _ = self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': v1})
+        self.assertEqual(status, 200)
+        v2 = hdr['X-GHG-Revision']
+        status, _, _ = self.request('POST', '/api/backups/restore', json.dumps({'name': name}), {'X-GHG-Revision': v1})
+        self.assertEqual(status, 409)
+        status, _, _ = self.request('POST', '/api/backups/restore', json.dumps({'name': '../../inventory.sqlite3'}), {'X-GHG-Revision': v2})
+        self.assertEqual(status, 400)
+        status, _, _ = self.request('POST', '/api/backups/restore', json.dumps({'name': name}), {'X-GHG-Revision': v2})
+        self.assertEqual(status, 200)
+        restored = json.loads(self.request('GET', '/api/inventory')[2])
+        self.assertEqual(restored['settings'], {'year': 2026})
+        copies = list(self.app.BACKUPS.glob('*.sqlite3'))
+        self.assertGreaterEqual(len(copies), 2)
+        snapshots = []
+        for copy in copies:
+            with sqlite3.connect(copy) as con:
+                snapshots.append(json.loads(con.execute('select payload from inventory').fetchone()[0]))
+        self.assertTrue(any(x['settings'].get('company') == '模擬第二版' for x in snapshots))
+        self.assertEqual(self.request('GET', '/api/backups', headers={'X-GHG-Token':'bad'})[0], 404)
+
     def test_offline_excel_endpoints(self):
         matrix = [['名稱', '數值'], ['模擬資料', '12']]
         status, headers, workbook = self.request('POST', '/api/xlsx/write', json.dumps(matrix).encode())
