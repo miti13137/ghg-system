@@ -11,6 +11,7 @@ import secrets
 import webbrowser
 import xlsx_local
 import inventory_quality
+from annual_report import annual_report
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -189,6 +190,14 @@ const localStore = {
             if hashlib.sha256(row[0]).hexdigest() != row[1]:
                 return self.reply(500, b'{"error":"integrity"}')
             return self.reply(200, row[0], "application/octet-stream")
+        report = re.fullmatch(r"/api/report/([0-9]{4})", self.path)
+        if report and self.headers.get("X-GHG-Token") == TOKEN:
+            with connect() as con:
+                row = con.execute("SELECT payload FROM inventory WHERE id=1").fetchone()
+            if row is None:
+                return self.reply(404, b"{}")
+            html = annual_report(json.loads(row[0]), report.group(1))
+            return self.reply(200, html.encode("utf-8"), "text/html; charset=utf-8")
         if self.path == "/api/quality" and self.headers.get("X-GHG-Token") == TOKEN:
             with connect() as con:
                 row = con.execute("SELECT payload FROM inventory WHERE id=1").fetchone()

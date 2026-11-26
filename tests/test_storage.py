@@ -199,6 +199,30 @@ class StorageTests(unittest.TestCase):
         self.data['assessments'] = 'invalid'
         self.assertEqual(self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': hdr['X-GHG-Revision']})[0], 400)
 
+    def test_annual_report_filters_and_escapes_saved_data(self):
+        self.data['settings']['company'] = '<模擬公司>'
+        self.data['records'] = [
+            {'id': 'active', 'month': '2026-01', 'amount': 0.04,
+             'sourceSnapshot': {'cat': 2, 'name': '當年用電'}, 'status': '待審核'},
+            {'id': 'prior', 'month': '2025-01', 'amount': 99,
+             'sourceSnapshot': {'cat': 1, 'name': '前年度不應出現'}},
+            {'id': 'invalid', 'month': '2026-02', 'amount': 10},
+        ]
+        self.data['evidence'] = [{'recordId': 'active', 'name': '模擬憑證'}]
+        self.data['assessments'] = [{'year': 2026, 'reason': '年度評估理由'}]
+        _, revision, _ = self.request('GET', '/api/inventory')
+        self.assertEqual(self.request('PUT', '/api/inventory', json.dumps(self.data),
+                         {'X-GHG-Revision': revision['X-GHG-Revision']})[0], 200)
+        status, headers, raw = self.request('GET', '/api/report/2026')
+        self.assertEqual(status, 200)
+        self.assertIn('text/html', headers['Content-Type'])
+        html = raw.decode()
+        for value in ('&lt;模擬公司&gt;', '0.04 tCO₂e', '模擬憑證', '年度評估理由',
+                      '未審核 2 筆', '1 筆因類別或排放量無效'):
+            self.assertIn(value, html)
+        self.assertNotIn('前年度不應出現', html)
+        self.assertEqual(self.request('GET', '/api/report/2026', headers={'X-GHG-Token': 'bad'})[0], 404)
+
     def test_offline_excel_endpoints(self):
         matrix = [['名稱', '數值'], ['模擬資料', '12']]
         status, headers, workbook = self.request('POST', '/api/xlsx/write', json.dumps(matrix).encode())
