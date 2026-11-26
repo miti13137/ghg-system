@@ -62,6 +62,17 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(previous['settings'], {'year': 2026})
             self.assertEqual(con.execute('pragma integrity_check').fetchone()[0], 'ok')
 
+    def test_offline_excel_endpoints(self):
+        matrix = [['名稱', '數值'], ['模擬資料', '12']]
+        status, headers, workbook = self.request('POST', '/api/xlsx/write', json.dumps(matrix).encode())
+        self.assertEqual(status, 200)
+        self.assertIn('spreadsheetml', headers['Content-Type'])
+        status, _, content = self.request('POST', '/api/xlsx/read', workbook)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(content), matrix)
+        self.assertEqual(self.request('POST', '/api/xlsx/read', workbook, {'X-GHG-Token':'bad'})[0], 403)
+        self.assertEqual(self.request('POST', '/api/xlsx/read', b'invalid')[0], 400)
+
     def test_access_validation_and_offline_html(self):
         status, _, html = self.request('GET', '/')
         self.assertEqual(status, 200)

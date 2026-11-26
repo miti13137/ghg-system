@@ -6,6 +6,7 @@ import os
 import sqlite3
 import secrets
 import webbrowser
+import xlsx_local
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -107,6 +108,23 @@ const localStore = {
             self.response_revision = revision(row[0] if row else None)
             return self.reply(200, (row[0] if row else "null").encode())
         return self.reply(404, b"{}")
+
+    def do_POST(self):
+        if not self.allowed() or self.headers.get("X-GHG-Token") != TOKEN or self.path not in ("/api/xlsx/read", "/api/xlsx/write"):
+            return self.reply(403, b"{}")
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            if not 0 < size <= xlsx_local.MAX_FILE:
+                raise ValueError("檔案太大或沒有內容")
+            data = self.rfile.read(size)
+            if self.path == "/api/xlsx/read":
+                matrix = xlsx_local.read_xlsx(data)
+                return self.reply(200, json.dumps(matrix, ensure_ascii=False).encode("utf-8"))
+            matrix = json.loads(data)
+            body = xlsx_local.write_xlsx(matrix)
+            return self.reply(200, body, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except (ValueError, TypeError, OSError, OverflowError) as e:
+            return self.reply(400, json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
 
     def do_PUT(self):
         if not self.allowed() or self.path != "/api/inventory" or self.headers.get("X-GHG-Token") != TOKEN:
