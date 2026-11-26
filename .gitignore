@@ -1,0 +1,14 @@
+# Local inventories, backups and evidence must never be committed
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3-wal
+*.sqlite3-shm
+backups/
+evidence/
+uploads/
+__pycache__/
+*.py[cod]
+.env
