@@ -10,6 +10,7 @@ import sqlite3
 import secrets
 import webbrowser
 import xlsx_local
+import inventory_quality
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -184,6 +185,16 @@ const localStore = {
             if hashlib.sha256(row[0]).hexdigest() != row[1]:
                 return self.reply(500, b'{"error":"integrity"}')
             return self.reply(200, row[0], "application/octet-stream")
+        if self.path == "/api/quality" and self.headers.get("X-GHG-Token") == TOKEN:
+            with connect() as con:
+                row = con.execute("SELECT payload FROM inventory WHERE id=1").fetchone()
+            if row is None:
+                return self.reply(200, b"[]")
+            try:
+                issues = inventory_quality.check(json.loads(row[0]))
+                return self.reply(200, json.dumps(issues, ensure_ascii=False).encode("utf-8"))
+            except (ValueError, TypeError, OverflowError):
+                return self.reply(400, b'{"error":"invalid inventory"}')
         if self.path == "/api/history" and self.headers.get("X-GHG-Token") == TOKEN:
             with connect() as con:
                 rows = con.execute("SELECT id,changed_at,operation,collection,item_id,before_json,after_json,reason FROM change_history ORDER BY id DESC LIMIT 500").fetchall()

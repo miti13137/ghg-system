@@ -176,6 +176,16 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(any(x['collection'] == 'records' and x['operation'] == '修改' and json.loads(x['before'])['qty'] == 100 and json.loads(x['after'])['qty'] == 101 for x in history))
         self.assertEqual(self.request('GET', '/api/history', headers={'X-GHG-Token':'bad'})[0], 404)
 
+    def test_quality_check_endpoint(self):
+        self.data['settings'] = {'year': 2026}
+        self.data['records'] = [{'id':'mock','month':'invalid','qty':10}]
+        _, h, _ = self.request('GET', '/api/inventory')
+        self.assertEqual(self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': h['X-GHG-Revision']})[0], 200)
+        status, _, data = self.request('GET', '/api/quality')
+        self.assertEqual(status, 200)
+        self.assertTrue(any('月份格式' in item['message'] for item in json.loads(data)))
+        self.assertEqual(self.request('GET', '/api/quality', headers={'X-GHG-Token':'bad'})[0], 404)
+
     def test_offline_excel_endpoints(self):
         matrix = [['名稱', '數值'], ['模擬資料', '12']]
         status, headers, workbook = self.request('POST', '/api/xlsx/write', json.dumps(matrix).encode())
