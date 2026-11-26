@@ -25,6 +25,7 @@ def connect():
     con = sqlite3.connect(DB)
     con.execute("CREATE TABLE IF NOT EXISTS inventory (id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL)")
     con.execute("CREATE TABLE IF NOT EXISTS evidence_files (id TEXT PRIMARY KEY, filename TEXT NOT NULL, sha256 TEXT NOT NULL, content BLOB NOT NULL)")
+    con.execute("CREATE TABLE IF NOT EXISTS change_history (id INTEGER PRIMARY KEY AUTOINCREMENT, changed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), operation TEXT NOT NULL, collection TEXT NOT NULL, item_id TEXT NOT NULL, before_json TEXT, after_json TEXT, reason TEXT NOT NULL DEFAULT '')")
     return con
 
 def validate(data):
@@ -37,6 +38,69 @@ def validate(data):
 
 def revision(payload):
     return hashlib.sha256((payload if payload is not None else "null").encode("utf-8")).hexdigest()
+
+
+def protect_reviewed(previous, payload):
+    if previous is None:
+        return
+    old, new = json.loads(previous), json.loads(payload)
+    updated = {}
+    for record in new["records"]:
+        key = record.get("id")
+        if isinstance(key, str):
+            if key in updated:
+                raise ValueError("重複紀錄編號")
+            updated[key] = record
+    for record in old["records"]:
+        if record.get("status") != "已審核":
+            continue
+        replacement = updated.get(record.get("id"))
+        if replacement == record:
+            continue
+        returned = dict(record)
+        returned["status"] = "退回"
+        if replacement != returned:
+            raise ValueError("已審核的紀錄需先退回，才能修改或刪除")
+
+
+def change_events(previous, payload, reason):
+    """Produce explicit before/after records without asserting a user identity."""
+    old = json.loads(previous) if previous else {"settings": {}, **{k: [] for k in KEYS}}
+    new = json.loads(payload)
+    events = []
+    def add(operation, collection, item_id, before, after):
+        events.append((operation, collection, str(item_id),
+                       json.dumps(before, ensure_ascii=False) if before is not None else None,
+                       json.dumps(after, ensure_ascii=False) if after is not None else None, reason))
+    if old.get("settings") != new.get("settings"):
+        add("修改", "settings", "settings", old.get("settings"), new.get("settings"))
+    for collection in KEYS:
+        before_list, after_list = old.get(collection, []), new.get(collection, [])
+        def index(items):
+            mapping = {}
+            for item in items:
+                key = item.get("id")
+                if not isinstance(key, str) or not key or key in mapping:
+                    return None
+                mapping[key] = item
+            return mapping
+        before, after = index(before_list), index(after_list)
+        if before is None or after is None:
+            if before_list != after_list:
+                add("整批變更", collection, "(清單)", before_list, after_list)
+            continue
+        for key in sorted(before.keys() | after.keys()):
+            if key not in before: add("新增", collection, key, None, after[key])
+            elif key not in after: add("刪除", collection, key, before[key], None)
+            elif before[key] != after[key]: add("修改", collection, key, before[key], after[key])
+    return events
+
+
+def write_history(con, previous, payload, reason):
+    events = change_events(previous, payload, reason)
+    if not events and reason == "備份還原":
+        events = [("還原", "inventory", "(全部)", None, None, reason)]
+    con.executemany("INSERT INTO change_history(operation,collection,item_id,before_json,after_json,reason) VALUES(?,?,?,?,?,?)", events)
 
 
 def backup_database(con):
@@ -120,6 +184,11 @@ const localStore = {
             if hashlib.sha256(row[0]).hexdigest() != row[1]:
                 return self.reply(500, b'{"error":"integrity"}')
             return self.reply(200, row[0], "application/octet-stream")
+        if self.path == "/api/history" and self.headers.get("X-GHG-Token") == TOKEN:
+            with connect() as con:
+                rows = con.execute("SELECT id,changed_at,operation,collection,item_id,before_json,after_json,reason FROM change_history ORDER BY id DESC LIMIT 500").fetchall()
+            keys = ("id", "changed_at", "operation", "collection", "item_id", "before", "after", "reason")
+            return self.reply(200, json.dumps([dict(zip(keys, row)) for row in rows], ensure_ascii=False).encode("utf-8"))
         if self.path == "/api/backups" and self.headers.get("X-GHG-Token") == TOKEN:
             return self.reply(200, json.dumps(self.backup_names()).encode("utf-8"))
         if self.path == "/api/inventory" and self.headers.get("X-GHG-Token") == TOKEN:
@@ -185,6 +254,7 @@ const localStore = {
                 backup_database(con)
                 con.execute("INSERT INTO evidence_files(id,filename,sha256,content) VALUES(?,?,?,?)", (file_id, filename, digest, content))
                 con.execute("UPDATE inventory SET payload=? WHERE id=1", (payload,))
+                write_history(con, previous, payload, "佐證上傳")
             self.response_revision = revision(payload)
             return self.reply(200, b"{}")
         except (ValueError, TypeError, sqlite3.Error, OSError, OverflowError, binascii.Error):
@@ -235,6 +305,7 @@ const localStore = {
                 for item in evidence_files:
                     con.execute("INSERT INTO evidence_files(id,filename,sha256,content) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET filename=excluded.filename,sha256=excluded.sha256,content=excluded.content", item)
                 con.execute("UPDATE inventory SET payload=? WHERE id=1", (payload,))
+                write_history(con, previous, payload, "備份還原")
             self.response_revision = revision(payload)
             return self.reply(200, b"{}")
         except (ValueError, TypeError, sqlite3.Error, OSError, OverflowError) as e:
@@ -253,9 +324,11 @@ const localStore = {
                 previous = row[0] if row else None
                 if self.headers.get("X-GHG-Revision") != revision(previous):
                     return self.reply(409, b'{"error":"stale revision"}')
+                protect_reviewed(previous, payload)
                 if previous is not None and previous != payload:
                     backup_database(con)
                 con.execute("INSERT INTO inventory VALUES(1, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", (payload,))
+                write_history(con, previous, payload, "資料儲存")
             self.response_revision = revision(payload)
             self.reply(200, b"{}")
         except (ValueError, TypeError, sqlite3.Error, OSError):

@@ -87,6 +87,8 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(status, 200)
         restored = json.loads(self.request('GET', '/api/inventory')[2])
         self.assertEqual(restored['settings'], {'year': 2026})
+        history = json.loads(self.request('GET', '/api/history')[2])
+        self.assertTrue(any(x['reason'] == '備份還原' for x in history))
         copies = list(self.app.BACKUPS.glob('*.sqlite3'))
         self.assertGreaterEqual(len(copies), 2)
         snapshots = []
@@ -149,6 +151,30 @@ class StorageTests(unittest.TestCase):
         upload['filename'] = '../test.pdf'
         self.assertEqual(self.request('POST', '/api/evidence/upload', json.dumps(upload), {'X-GHG-Revision': revision})[0], 400)
         self.assertEqual(json.loads(self.request('GET', '/api/inventory')[2])['evidence'], [])
+
+    def test_reviewed_records_protected_and_history(self):
+        self.data['records'] = [{'id': 'record1', 'status': '待審核', 'qty': 100}]
+        _, h, _ = self.request('GET', '/api/inventory')
+        _, h, _ = self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': h['X-GHG-Revision']})
+        self.data['records'][0]['status'] = '已審核'
+        status, h, _ = self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': h['X-GHG-Revision']})
+        self.assertEqual(status, 200)
+        reviewed_revision = h['X-GHG-Revision']
+        initial_history = json.loads(self.request('GET', '/api/history')[2])
+        self.assertTrue(any(x['collection'] == 'records' and x['operation'] == '修改' and json.loads(x['after'])['status'] == '已審核' for x in initial_history))
+        self.data['records'][0]['qty'] = 999
+        self.assertEqual(self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': reviewed_revision})[0], 400)
+        self.data['records'] = []
+        self.assertEqual(self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': reviewed_revision})[0], 400)
+        self.assertEqual(len(json.loads(self.request('GET', '/api/history')[2])), len(initial_history))
+        self.data['records'] = [{'id':'record1','status':'退回','qty':100}]
+        status, h, _ = self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': reviewed_revision})
+        self.assertEqual(status, 200)
+        self.data['records'][0]['qty'] = 101
+        self.assertEqual(self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': h['X-GHG-Revision']})[0], 200)
+        history = json.loads(self.request('GET', '/api/history')[2])
+        self.assertTrue(any(x['collection'] == 'records' and x['operation'] == '修改' and json.loads(x['before'])['qty'] == 100 and json.loads(x['after'])['qty'] == 101 for x in history))
+        self.assertEqual(self.request('GET', '/api/history', headers={'X-GHG-Token':'bad'})[0], 404)
 
     def test_offline_excel_endpoints(self):
         matrix = [['名稱', '數值'], ['模擬資料', '12']]
