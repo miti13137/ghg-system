@@ -1,4 +1,6 @@
 import http.client
+import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -93,6 +95,60 @@ class StorageTests(unittest.TestCase):
                 snapshots.append(json.loads(con.execute('select payload from inventory').fetchone()[0]))
         self.assertTrue(any(x['settings'].get('company') == '模擬第二版' for x in snapshots))
         self.assertEqual(self.request('GET', '/api/backups', headers={'X-GHG-Token':'bad'})[0], 404)
+
+    def test_evidence_upload_download_and_backup(self):
+        self.data['records'] = [{'id': 'mock-record', 'month': '2026-01'}]
+        _, hdr, _ = self.request('GET', '/api/inventory')
+        status, hdr, _ = self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': hdr['X-GHG-Revision']})
+        self.assertEqual(status, 200)
+        old_revision = hdr['X-GHG-Revision']
+        data = b'simulated evidence file'
+        upload = {'recordId': 'mock-record', 'filename': '模擬.pdf', 'name': '模擬電費單', 'note': '測試', 'content': base64.b64encode(data).decode()}
+        status, hdr, _ = self.request('POST', '/api/evidence/upload', json.dumps(upload), {'X-GHG-Revision': old_revision})
+        self.assertEqual(status, 200)
+        current_revision = hdr['X-GHG-Revision']
+        status, _, raw = self.request('GET', '/api/inventory')
+        evidence = json.loads(raw)['evidence'][0]
+        file_id = evidence['fileId']
+        self.assertEqual(evidence['sha256'], hashlib.sha256(data).hexdigest())
+        self.assertEqual(self.request('GET', '/api/evidence/' + file_id)[2], data)
+        self.assertEqual(self.request('GET', '/api/evidence/' + file_id, headers={'X-GHG-Token':'bad'})[0], 404)
+        status, _, _ = self.request('POST', '/api/evidence/upload', json.dumps(upload), {'X-GHG-Revision': old_revision})
+        self.assertEqual(status, 409)
+        self.assertEqual(len(json.loads(self.request('GET', '/api/inventory')[2])['evidence']), 1)
+        status, _, _ = self.request('POST', '/api/backups/create', headers={'X-GHG-Revision': current_revision})
+        self.assertEqual(status, 200)
+        names = json.loads(self.request('GET', '/api/backups')[2])
+        found = False
+        for name in names:
+            with sqlite3.connect(self.app.BACKUPS / name) as con:
+                item = con.execute('select content from evidence_files where id=?', (file_id,)).fetchone()
+                if item and item[0] == data: found = True
+        self.assertTrue(found)
+        with sqlite3.connect(self.app.DB) as con:
+            con.execute('update evidence_files set content=? where id=?', (b'corrupt', file_id))
+        self.assertEqual(self.request('GET', '/api/evidence/' + file_id)[0], 500)
+        for name in names:
+            with sqlite3.connect(self.app.BACKUPS / name) as con:
+                item = con.execute('select content from evidence_files where id=?', (file_id,)).fetchone()
+                if item and item[0] == data:
+                    chosen = name
+                    break
+        status, _, _ = self.request('POST', '/api/backups/restore', json.dumps({'name': chosen}), {'X-GHG-Revision': current_revision})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.request('GET', '/api/evidence/' + file_id)[2], data)
+
+    def test_evidence_validation_keeps_data_unchanged(self):
+        self.data['records'] = [{'id': 'mock-record'}]
+        _, h, _ = self.request('GET', '/api/inventory')
+        _, h, _ = self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': h['X-GHG-Revision']})
+        revision = h['X-GHG-Revision']
+        upload = {'recordId': 'missing', 'filename': 'test.pdf', 'name':'test', 'note':'', 'content':base64.b64encode(b'test').decode()}
+        self.assertEqual(self.request('POST', '/api/evidence/upload', json.dumps(upload), {'X-GHG-Revision': revision})[0], 400)
+        upload['recordId'] = 'mock-record'
+        upload['filename'] = '../test.pdf'
+        self.assertEqual(self.request('POST', '/api/evidence/upload', json.dumps(upload), {'X-GHG-Revision': revision})[0], 400)
+        self.assertEqual(json.loads(self.request('GET', '/api/inventory')[2])['evidence'], [])
 
     def test_offline_excel_endpoints(self):
         matrix = [['名稱', '數值'], ['模擬資料', '12']]

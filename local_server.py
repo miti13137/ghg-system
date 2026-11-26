@@ -1,5 +1,7 @@
 """GHG V2 local storage prototype. Python 3.10+, standard library only."""
 import json
+import base64
+import binascii
 import hashlib
 import time
 import re
@@ -22,6 +24,7 @@ KEYS = ("sources", "factors", "records", "evidence", "audit")
 def connect():
     con = sqlite3.connect(DB)
     con.execute("CREATE TABLE IF NOT EXISTS inventory (id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL)")
+    con.execute("CREATE TABLE IF NOT EXISTS evidence_files (id TEXT PRIMARY KEY, filename TEXT NOT NULL, sha256 TEXT NOT NULL, content BLOB NOT NULL)")
     return con
 
 def validate(data):
@@ -109,6 +112,14 @@ const localStore = {
             html = html.replace("目前仍使用本機瀏覽器儲存", "目前使用本機 SQLite 儲存")
             html = html.replace("catch{db=fresh()}", "catch(e){document.body.textContent='資料庫讀取失敗，請勿繼續操作。';throw e}")
             return self.reply(200, html.encode(), "text/html; charset=utf-8")
+        if re.fullmatch(r"/api/evidence/[0-9a-f]{32}", self.path) and self.headers.get("X-GHG-Token") == TOKEN:
+            with connect() as con:
+                row = con.execute("SELECT content, sha256 FROM evidence_files WHERE id=?", (self.path.rsplit("/", 1)[1],)).fetchone()
+            if not row:
+                return self.reply(404, b"{}")
+            if hashlib.sha256(row[0]).hexdigest() != row[1]:
+                return self.reply(500, b'{"error":"integrity"}')
+            return self.reply(200, row[0], "application/octet-stream")
         if self.path == "/api/backups" and self.headers.get("X-GHG-Token") == TOKEN:
             return self.reply(200, json.dumps(self.backup_names()).encode("utf-8"))
         if self.path == "/api/inventory" and self.headers.get("X-GHG-Token") == TOKEN:
@@ -119,6 +130,8 @@ const localStore = {
         return self.reply(404, b"{}")
 
     def do_POST(self):
+        if self.allowed() and self.headers.get("X-GHG-Token") == TOKEN and self.path == "/api/evidence/upload":
+            return self.evidence_upload()
         if self.allowed() and self.headers.get("X-GHG-Token") == TOKEN and self.path in ("/api/backups/create", "/api/backups/restore"):
             return self.backup_action()
         if not self.allowed() or self.headers.get("X-GHG-Token") != TOKEN or self.path not in ("/api/xlsx/read", "/api/xlsx/write"):
@@ -136,6 +149,46 @@ const localStore = {
             return self.reply(200, body, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         except (ValueError, TypeError, OSError, OverflowError) as e:
             return self.reply(400, json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
+
+    def evidence_upload(self):
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            if not 0 < size <= 7_100_000:
+                raise ValueError("檔案過大或沒有內容")
+            obj = json.loads(self.rfile.read(size))
+            if not isinstance(obj, dict):
+                raise ValueError("資料格式不正確")
+            filename, name, note, record_id, encoded = (obj.get(k) for k in ("filename", "name", "note", "recordId", "content"))
+            if any(not isinstance(x, str) for x in (filename, name, note, record_id, encoded)):
+                raise ValueError("欄位格式不正確")
+            if not filename.strip() or len(filename) > 255 or any(ord(c) < 32 for c in filename) or '/' in filename or chr(92) in filename:
+                raise ValueError("檔名不正確")
+            if not name.strip() or len(name) > 255 or len(note) > 2000 or len(record_id) > 255:
+                raise ValueError("文件名稱或備註不正確")
+            content = base64.b64decode(encoded, validate=True)
+            if not 0 < len(content) <= 5_000_000:
+                raise ValueError("檔案大小須介於 1 位元組至 5 MB")
+            digest = hashlib.sha256(content).hexdigest()
+            file_id = secrets.token_hex(16)
+            with connect() as con:
+                row = con.execute("SELECT payload FROM inventory WHERE id=1").fetchone()
+                previous = row[0] if row else None
+                if self.headers.get("X-GHG-Revision") != revision(previous):
+                    return self.reply(409, b'{"error":"stale revision"}')
+                data = json.loads(previous) if previous else None
+                if not data or not any(r.get("id") == record_id for r in data.get("records", [])):
+                    raise ValueError("找不到對應活動紀錄")
+                data["evidence"].append({"id": secrets.token_hex(16), "recordId": record_id,
+                    "name": name.strip(), "location": "本機資料庫", "note": note,
+                    "fileId": file_id, "filename": filename, "sha256": digest})
+                payload = validate(data)
+                backup_database(con)
+                con.execute("INSERT INTO evidence_files(id,filename,sha256,content) VALUES(?,?,?,?)", (file_id, filename, digest, content))
+                con.execute("UPDATE inventory SET payload=? WHERE id=1", (payload,))
+            self.response_revision = revision(payload)
+            return self.reply(200, b"{}")
+        except (ValueError, TypeError, sqlite3.Error, OSError, OverflowError, binascii.Error):
+            return self.reply(400, b'{"error":"invalid evidence"}')
 
     def backup_action(self):
         try:
@@ -165,8 +218,22 @@ const localStore = {
                     saved = source.execute("SELECT payload FROM inventory WHERE id=1").fetchone()
                     if not saved or len(saved[0]) > 50_000_000:
                         raise ValueError("備份內容不正確")
-                    payload = validate(json.loads(saved[0]))
+                    restored = json.loads(saved[0])
+                    payload = validate(restored)
+                    evidence_files = []
+                    for entry in restored["evidence"]:
+                        file_id = entry.get("fileId")
+                        if not file_id:
+                            continue
+                        if not isinstance(file_id, str) or not re.fullmatch(r"[0-9a-f]{32}", file_id):
+                            raise ValueError("備份佐證編號不正確")
+                        blob = source.execute("SELECT filename,sha256,content FROM evidence_files WHERE id=?", (file_id,)).fetchone()
+                        if not blob or len(blob[2]) > 5_000_000 or hashlib.sha256(blob[2]).hexdigest() != blob[1] or entry.get("sha256") != blob[1]:
+                            raise ValueError("備份佐證檔案遺失或損壞")
+                        evidence_files.append((file_id, *blob))
                 backup_database(con)
+                for item in evidence_files:
+                    con.execute("INSERT INTO evidence_files(id,filename,sha256,content) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET filename=excluded.filename,sha256=excluded.sha256,content=excluded.content", item)
                 con.execute("UPDATE inventory SET payload=? WHERE id=1", (payload,))
             self.response_revision = revision(payload)
             return self.reply(200, b"{}")
