@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-Hant">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GHG System V2.0｜本機登入</title>
+<style>
+body{font:16px system-ui,sans-serif;background:#edf5f0;color:#123c35;margin:0;padding:7vh 1rem}
+main{max-width:420px;background:white;padding:1.75rem;margin:auto;border-radius:16px;box-shadow:0 8px 32px #153d2918}
+label{display:block;margin:.9rem 0}input{display:block;width:100%;box-sizing:border-box;padding:.65rem;border:1px solid #8caaa0;border-radius:7px}
+button{padding:.7rem 1.3rem;border:0;border-radius:7px;background:#176a4d;color:white;font:inherit}p{line-height:1.5}
+</style>
+<main>
+<h1>GHG System V2.0</h1>
+<p id="prompt"></p>
+<form id="auth">
+<label>帳號<input id="name" autocomplete="username" maxlength="40" required></label>
+<label>密碼<input id="password" type="password" autocomplete="current-password" maxlength="128" required></label>
+<button id="submit"></button>
+<p id="result" role="status"></p>
+</form>
+</main>
+<script>
+const first = __SETUP__;
+const token = "__TOKEN__";
+const get = id => document.getElementById(id);
+get('prompt').textContent = first ? '首次啟動，請建立本機管理員。密碼至少 12 字元。' : '請使用本機帳號登入。';
+get('submit').textContent = first ? '建立管理員' : '登入';
+if(first) get('password').autocomplete = 'new-password';
+get('auth').addEventListener('submit', async event => {
+  event.preventDefault();
+  get('submit').disabled = true;
+  try {
+    const response = await fetch(first ? '/api/setup' : '/api/login', {
+      method:'POST', headers:{'Content-Type':'application/json','X-GHG-Token':token},
+      body:JSON.stringify({name:get('name').value,password:get('password').value})
+    });
+    if(!response.ok) throw Error((await response.json()).error || '無法登入。');
+    location.reload();
+  } catch (error) {
+    get('result').textContent = error.message;
+    get('submit').disabled = false;
+  }
+});
+</script>
+</html>

@@ -12,6 +12,7 @@ import webbrowser
 import xlsx_local
 import inventory_quality
 from annual_report import annual_report
+from local_auth import Accounts, LIFETIME
 from inventory_years import annual_totals, validate_year_settings
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -21,6 +22,7 @@ DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "GHGSystem"
 DATA.mkdir(parents=True, exist_ok=True)
 DB = DATA / "inventory.sqlite3"
 TOKEN = secrets.token_urlsafe(32)
+ACCOUNTS = Accounts(DATA / "accounts.sqlite3")
 BACKUPS = DATA / "backups"
 KEYS = ("sources", "factors", "records", "evidence", "audit")
 OPTIONAL_KEYS = ("assessments", "yearSettings")
@@ -30,6 +32,8 @@ def connect():
     con.execute("CREATE TABLE IF NOT EXISTS inventory (id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL)")
     con.execute("CREATE TABLE IF NOT EXISTS evidence_files (id TEXT PRIMARY KEY, filename TEXT NOT NULL, sha256 TEXT NOT NULL, content BLOB NOT NULL)")
     con.execute("CREATE TABLE IF NOT EXISTS change_history (id INTEGER PRIMARY KEY AUTOINCREMENT, changed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), operation TEXT NOT NULL, collection TEXT NOT NULL, item_id TEXT NOT NULL, before_json TEXT, after_json TEXT, reason TEXT NOT NULL DEFAULT '')")
+    if "actor" not in {row[1] for row in con.execute("PRAGMA table_info(change_history)")}:
+        con.execute("ALTER TABLE change_history ADD COLUMN actor TEXT")
     return con
 
 def validate(data):
@@ -71,6 +75,40 @@ def protect_reviewed(previous, payload):
             raise ValueError("已審核的紀錄需先退回，才能修改或刪除")
 
 
+def review_permissions(previous, payload, role):
+    old = json.loads(previous) if previous else {"records": []}
+    new = json.loads(payload)
+    if role == "reviewer":
+        if previous is None:
+            return False
+        for key in OPTIONAL_KEYS:
+            old.setdefault(key, [])
+            new.setdefault(key, [])
+        if {k: v for k, v in old.items() if k != "records"} != {k: v for k, v in new.items() if k != "records"}:
+            return False
+        if len(old["records"]) != len(new["records"]):
+            return False
+        for before, after in zip(old["records"], new["records"]):
+            if before == after:
+                continue
+            allowed = {"待審核": ("已審核", "退回"), "已審核": ("退回",)}
+            status = before.get("status")
+            target = after.get("status")
+            if not isinstance(status, str) or target not in allowed.get(status, ()):
+                return False
+            if after != {**before, "status": target}:
+                return False
+        return True
+    reviewed = {item.get("id"): item for item in old["records"]
+                if isinstance(item.get("id"), str) and item.get("status") in ("已審核", "退回")}
+    for item in new["records"]:
+        if item.get("status") in ("已審核", "退回"):
+            prior = reviewed.get(item.get("id")) if isinstance(item.get("id"), str) else None
+            if not prior or prior.get("status") != item.get("status"):
+                return False
+    return True
+
+
 def change_events(previous, payload, reason):
     """Produce explicit before/after records without asserting a user identity."""
     old = json.loads(previous) if previous else {"settings": {}, **{k: [] for k in KEYS}}
@@ -104,11 +142,12 @@ def change_events(previous, payload, reason):
     return events
 
 
-def write_history(con, previous, payload, reason):
+def write_history(con, previous, payload, reason, actor):
     events = change_events(previous, payload, reason)
     if not events and reason == "備份還原":
         events = [("還原", "inventory", "(全部)", None, None, reason)]
-    con.executemany("INSERT INTO change_history(operation,collection,item_id,before_json,after_json,reason) VALUES(?,?,?,?,?,?)", events)
+    con.executemany("INSERT INTO change_history(operation,collection,item_id,before_json,after_json,reason,actor) VALUES(?,?,?,?,?,?,?)",
+                    [(*event, actor) for event in events])
 
 
 def backup_database(con):
@@ -139,6 +178,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         if hasattr(self, "response_revision"):
             self.send_header("X-GHG-Revision", self.response_revision)
+        if hasattr(self, "session_cookie"):
+            self.send_header("Set-Cookie", self.session_cookie)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -152,13 +193,67 @@ class Handler(BaseHTTPRequestHandler):
         pattern = re.compile(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{8}\.sqlite3")
         return sorted((p.name for p in BACKUPS.iterdir() if pattern.fullmatch(p.name) and p.is_file() and not p.is_symlink()), reverse=True)
 
+    def json_reply(self, status, data):
+        return self.reply(status, json.dumps(data, ensure_ascii=False).encode())
+
+    def identified(self):
+        return ACCOUNTS.identify(self.headers.get("Cookie"))
+
+    def auth_page(self):
+        template = (ROOT / "login.html").read_text(encoding="utf-8")
+        return self.reply(200, template.replace("__TOKEN__", TOKEN).replace(
+            "__SETUP__", "true" if ACCOUNTS.empty() else "false").encode(),
+            "text/html; charset=utf-8")
+
+    def auth_action(self):
+        path = self.path
+        account = self.identified()
+        if path == "/api/logout":
+            ACCOUNTS.sessions.pop(ACCOUNTS.session_key(self.headers.get("Cookie")), None)
+            self.session_cookie = f"{ACCOUNTS.cookie}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"
+            return self.json_reply(200, {})
+        if path in ("/api/users", "/api/users/update") and (not account or account[1] != "admin"):
+            return self.json_reply(403, {"error": "此功能僅開放給管理員。"})
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            if not 0 < size <= 8192:
+                raise ValueError("帳號資料格式不正確。")
+            fields = json.loads(self.rfile.read(size))
+            if not isinstance(fields, dict):
+                raise ValueError("帳號資料格式不正確。")
+            name, password = fields.get("name"), fields.get("password")
+            if path == "/api/users/update":
+                ACCOUNTS.update(account[0], name, fields.get("action"), password)
+                return self.json_reply(200, {})
+            if path in ("/api/setup", "/api/users"):
+                first = path == "/api/setup"
+                if first and not ACCOUNTS.empty():
+                    return self.json_reply(409, {"error": "已建立管理員。"})
+                ACCOUNTS.add(name, password, "admin" if first else fields.get("role"), first=first)
+                return self.json_reply(201, {})
+            token = ACCOUNTS.login(name, password)
+            if not token:
+                return self.json_reply(401, {"error": "登入失敗，請確認帳密後稍候再試。"})
+            self.session_cookie = f"{ACCOUNTS.cookie}={token}; Path=/; Max-Age={LIFETIME}; HttpOnly; SameSite=Strict"
+            return self.json_reply(200, {})
+        except (ValueError, UnicodeError, RecursionError) as error:
+            return self.json_reply(400, {"error": str(error)})
+        except (sqlite3.Error, OSError):
+            return self.json_reply(500, {"error": "無法讀寫本機帳號資料庫。"})
+
     def do_GET(self):
         if not self.allowed():
             return self.reply(403, b"{}")
+        account = self.identified()
+        if self.path == "/" and not account:
+            return self.auth_page()
+        if self.path != "/" and (not account or self.headers.get("X-GHG-Token") != TOKEN):
+            return self.reply(404, b"{}")
         if self.path == "/":
             html = (ROOT / "index.html").read_text(encoding="utf-8")
             bridge = """<script>
 const localToken = "__TOKEN__";
+const localAccount = __ACCOUNT__;
 let localRevision = null;
 function localRequest(method, data) {
   const req = new XMLHttpRequest();
@@ -167,6 +262,7 @@ function localRequest(method, data) {
   if (method === "PUT") { req.setRequestHeader("Content-Type", "application/json"); req.setRequestHeader("X-GHG-Revision", localRevision || ""); }
   req.send(data || null);
   if (req.status === 409) { alert("資料已由其他視窗變更，本次未儲存。請重新整理後再操作。"); throw Error("資料版本衝突，本次未儲存"); }
+  if (req.status === 403) { alert("此帳號無權執行這項操作，或登入已逾時。"); throw Error("權限不足"); }
   if (req.status !== 200) { alert("資料儲存或讀取失敗，本次變更可能未儲存。請保留畫面並聯絡管理人員。"); throw Error("Local database request failed: " + req.status); }
   localRevision = req.getResponseHeader("X-GHG-Revision");
   return req.responseText;
@@ -175,15 +271,17 @@ const localStore = {
   getItem: () => { const raw = localRequest("GET"); return raw === "null" ? null : raw; },
   setItem: (key, value) => { localRequest("PUT", value); }
 };
-</script>""".replace("__TOKEN__", TOKEN)
+</script>""".replace("__TOKEN__", TOKEN).replace("__ACCOUNT__", json.dumps(account))
             html = html.replace('<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>', "")
             html = html.replace("Excel 功能載入失敗，請確認網路連線後重新整理。", "離線預覽版尚未提供 Excel 功能，請使用 CSV 或 JSON 備份。")
             html = html.replace("<script>", bridge + "<script>", 1).replace("localStorage.getItem", "localStore.getItem").replace("localStorage.setItem", "localStore.setItem")
-            html = html.replace("企業溫室氣體盤查管理系統 V1.0", "企業溫室氣體盤查管理系統 V2.0 Local Preview")
-            html = html.replace("本版資料儲存在此瀏覽器的 localStorage，尚未提供登入、多人同步、真正檔案儲存或雲端備份。", "本機預覽版使用 SQLite 儲存；尚未提供登入或多人同步。")
+            html = html.replace("企業溫室氣體盤查管理系統 V1.0", "企業溫室氣體盤查管理系統 V2.0 本機預覽版")
+            html = html.replace("本版資料儲存在此瀏覽器的 localStorage，尚未提供登入、多人同步、真正檔案儲存或雲端備份。", "本機預覽版使用 SQLite 儲存。請定期建立備份。")
             html = html.replace("目前仍使用本機瀏覽器儲存", "目前使用本機 SQLite 儲存")
             html = html.replace("catch{db=fresh()}", "catch(e){document.body.textContent='資料庫讀取失敗，請勿繼續操作。';throw e}")
             return self.reply(200, html.encode(), "text/html; charset=utf-8")
+        if self.path == "/api/users" and account[1] == "admin":
+            return self.json_reply(200, ACCOUNTS.list_users())
         if re.fullmatch(r"/api/evidence/[0-9a-f]{32}", self.path) and self.headers.get("X-GHG-Token") == TOKEN:
             with connect() as con:
                 row = con.execute("SELECT content, sha256 FROM evidence_files WHERE id=?", (self.path.rsplit("/", 1)[1],)).fetchone()
@@ -217,10 +315,10 @@ const localStore = {
                 return self.reply(400, b'{"error":"invalid inventory"}')
         if self.path == "/api/history" and self.headers.get("X-GHG-Token") == TOKEN:
             with connect() as con:
-                rows = con.execute("SELECT id,changed_at,operation,collection,item_id,before_json,after_json,reason FROM change_history ORDER BY id DESC LIMIT 500").fetchall()
-            keys = ("id", "changed_at", "operation", "collection", "item_id", "before", "after", "reason")
+                rows = con.execute("SELECT id,changed_at,operation,collection,item_id,before_json,after_json,reason,actor FROM change_history ORDER BY id DESC LIMIT 500").fetchall()
+            keys = ("id", "changed_at", "operation", "collection", "item_id", "before", "after", "reason", "actor")
             return self.reply(200, json.dumps([dict(zip(keys, row)) for row in rows], ensure_ascii=False).encode("utf-8"))
-        if self.path == "/api/backups" and self.headers.get("X-GHG-Token") == TOKEN:
+        if self.path == "/api/backups" and account[1] == "admin":
             return self.reply(200, json.dumps(self.backup_names()).encode("utf-8"))
         if self.path == "/api/inventory" and self.headers.get("X-GHG-Token") == TOKEN:
             with connect() as con:
@@ -230,6 +328,19 @@ const localStore = {
         return self.reply(404, b"{}")
 
     def do_POST(self):
+        if not self.allowed() or self.headers.get("X-GHG-Token") != TOKEN:
+            return self.reply(403, b"{}")
+        if self.path in ("/api/setup", "/api/login", "/api/logout", "/api/users", "/api/users/update"):
+            return self.auth_action()
+        account = self.identified()
+        if not account:
+            return self.reply(403, b"{}")
+        self.actor, role = account
+        if self.path.startswith(("/api/migrate-v1/", "/api/backups/")) and role != "admin":
+            return self.reply(403, b"{}")
+        if self.path in ("/api/evidence/upload", "/api/xlsx/read") and role not in ("admin", "editor"):
+            return self.reply(403, b"{}")
+
         if self.path in ("/api/migrate-v1/preview", "/api/migrate-v1/apply"):
             if not self.allowed() or self.headers.get("X-GHG-Token") != TOKEN:
                 return self.reply(403, b"{}")
@@ -284,7 +395,7 @@ const localStore = {
                     if self.headers.get("X-GHG-Import-Preview") != fingerprint:
                         return self.reply(409, '{"error":"檔案與預覽不同，請重新預覽"}'.encode())
                     con.execute("INSERT INTO inventory VALUES(1, ?)", (payload,))
-                    write_history(con, None, payload, "V1 資料移轉")
+                    write_history(con, None, payload, "V1 資料移轉", self.actor)
             return self.reply(200, json.dumps({
                 "year": data["settings"]["year"], "counts": {key: len(data[key]) for key in KEYS},
                 "preview": fingerprint,
@@ -329,7 +440,7 @@ const localStore = {
                 backup_database(con)
                 con.execute("INSERT INTO evidence_files(id,filename,sha256,content) VALUES(?,?,?,?)", (file_id, filename, digest, content))
                 con.execute("UPDATE inventory SET payload=? WHERE id=1", (payload,))
-                write_history(con, previous, payload, "佐證上傳")
+                write_history(con, previous, payload, "佐證上傳", self.actor)
             self.response_revision = revision(payload)
             return self.reply(200, b"{}")
         except (ValueError, TypeError, sqlite3.Error, OSError, OverflowError, binascii.Error):
@@ -380,13 +491,17 @@ const localStore = {
                 for item in evidence_files:
                     con.execute("INSERT INTO evidence_files(id,filename,sha256,content) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET filename=excluded.filename,sha256=excluded.sha256,content=excluded.content", item)
                 con.execute("UPDATE inventory SET payload=? WHERE id=1", (payload,))
-                write_history(con, previous, payload, "備份還原")
+                write_history(con, previous, payload, "備份還原", self.actor)
             self.response_revision = revision(payload)
             return self.reply(200, b"{}")
         except (ValueError, TypeError, sqlite3.Error, OSError, OverflowError) as e:
             return self.reply(400, json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
 
     def do_PUT(self):
+        account = self.identified()
+        if not account or account[1] == "viewer":
+            return self.reply(403, b"{}")
+        self.actor, role = account
         if not self.allowed() or self.path != "/api/inventory" or self.headers.get("X-GHG-Token") != TOKEN:
             return self.reply(403, b"{}")
         try:
@@ -399,11 +514,13 @@ const localStore = {
                 previous = row[0] if row else None
                 if self.headers.get("X-GHG-Revision") != revision(previous):
                     return self.reply(409, b'{"error":"stale revision"}')
+                if not review_permissions(previous, payload, role):
+                    return self.json_reply(403, {"error": "此帳號無權進行這項變更。"})
                 protect_reviewed(previous, payload)
                 if previous is not None and previous != payload:
                     backup_database(con)
                 con.execute("INSERT INTO inventory VALUES(1, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", (payload,))
-                write_history(con, previous, payload, "資料儲存")
+                write_history(con, previous, payload, "資料儲存", self.actor)
             self.response_revision = revision(payload)
             self.reply(200, b"{}")
         except (ValueError, TypeError, sqlite3.Error, OSError):

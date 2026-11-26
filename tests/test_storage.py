@@ -24,6 +24,12 @@ class StorageTests(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.port = self.server.server_port
+        self.cookie = ''
+        login = json.dumps({'name': 'test-admin', 'password': 'fixture-password-only'})
+        self.assertEqual(self.request('POST', '/api/setup', login)[0], 201)
+        status, headers, _ = self.request('POST', '/api/login', login)
+        self.assertEqual(status, 200)
+        self.cookie = headers['Set-Cookie'].split(';', 1)[0]
         self.data = {'settings': {'year': 2026}, 'sources': [], 'factors': [], 'records': [], 'evidence': [], 'audit': []}
 
     def tearDown(self):
@@ -34,7 +40,7 @@ class StorageTests(unittest.TestCase):
 
     def request(self, method, path, body=None, headers=None):
         conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
-        h = {'X-GHG-Token': self.app.TOKEN}
+        h = {'X-GHG-Token': self.app.TOKEN, 'Cookie': self.cookie}
         h.update(headers or {})
         conn.request(method, path, body=body, headers=h)
         response = conn.getresponse()
@@ -42,6 +48,35 @@ class StorageTests(unittest.TestCase):
         result = response.status, dict(response.getheaders()), data
         conn.close()
         return result
+
+    def create_user_cookie(self, role):
+        fields = json.dumps({'name': 'test-' + role, 'password': 'fixture-password-only', 'role': role})
+        self.assertEqual(self.request('POST', '/api/users', fields)[0], 201)
+        status, headers, _ = self.request('POST', '/api/login', fields, {'Cookie': ''})
+        self.assertEqual(status, 200)
+        return headers['Set-Cookie'].split(';', 1)[0]
+
+    def test_anonymous_and_read_only_access(self):
+        status, _, page = self.request('GET', '/', headers={'Cookie': ''})
+        self.assertEqual(status, 200)
+        self.assertIn(b'id="auth"', page)
+        self.assertEqual(self.request('GET', '/api/inventory', headers={'Cookie': ''})[0], 404)
+        viewer = self.create_user_cookie('viewer')
+        self.assertEqual(self.request('GET', '/api/inventory', headers={'Cookie': viewer})[0], 200)
+        self.assertEqual(self.request('PUT', '/api/inventory', '{}', {'Cookie': viewer})[0], 403)
+        self.assertEqual(self.request('POST', '/api/users', '{}', {'Cookie': viewer})[0], 403)
+        self.assertEqual(self.request('POST', '/api/logout', headers={'Cookie': viewer})[0], 200)
+        self.assertEqual(self.request('GET', '/api/inventory', headers={'Cookie': viewer})[0], 404)
+
+    def test_admin_can_disable_an_account_and_end_its_session(self):
+        editor = self.create_user_cookie('editor')
+        disable = json.dumps({'name': 'test-editor', 'action': 'disable'})
+        self.assertEqual(self.request('POST', '/api/users/update', disable, {'Cookie': editor})[0], 403)
+        self.assertEqual(self.request('POST', '/api/users/update', disable)[0], 200)
+        self.assertEqual(self.request('GET', '/api/inventory', headers={'Cookie': editor})[0], 404)
+        users = json.loads(self.request('GET', '/api/users')[2])
+        self.assertEqual(next(u for u in users if u['name'] == 'test-editor')['enabled'], False)
+        self.assertTrue(all(set(u) == {'name', 'role', 'enabled'} for u in users))
 
     def test_stale_write_and_backup(self):
         status, headers, data = self.request('GET', '/api/inventory')
@@ -156,8 +191,17 @@ class StorageTests(unittest.TestCase):
         self.data['records'] = [{'id': 'record1', 'status': '待審核', 'qty': 100}]
         _, h, _ = self.request('GET', '/api/inventory')
         _, h, _ = self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': h['X-GHG-Revision']})
+        pending_revision = h['X-GHG-Revision']
         self.data['records'][0]['status'] = '已審核'
-        status, h, _ = self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': h['X-GHG-Revision']})
+        self.assertEqual(self.request('PUT', '/api/inventory', json.dumps(self.data),
+                         {'X-GHG-Revision': pending_revision})[0], 403)
+        reviewer = self.create_user_cookie('reviewer')
+        self.data['records'][0]['qty'] = 999
+        self.assertEqual(self.request('PUT', '/api/inventory', json.dumps(self.data),
+                         {'X-GHG-Revision': pending_revision, 'Cookie': reviewer})[0], 403)
+        self.data['records'][0]['qty'] = 100
+        status, h, _ = self.request('PUT', '/api/inventory', json.dumps(self.data),
+                                    {'X-GHG-Revision': pending_revision, 'Cookie': reviewer})
         self.assertEqual(status, 200)
         reviewed_revision = h['X-GHG-Revision']
         initial_history = json.loads(self.request('GET', '/api/history')[2])
@@ -167,8 +211,9 @@ class StorageTests(unittest.TestCase):
         self.data['records'] = []
         self.assertEqual(self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': reviewed_revision})[0], 400)
         self.assertEqual(len(json.loads(self.request('GET', '/api/history')[2])), len(initial_history))
+        self.assertTrue(any(x['actor'] == 'test-reviewer' for x in initial_history))
         self.data['records'] = [{'id':'record1','status':'退回','qty':100}]
-        status, h, _ = self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': reviewed_revision})
+        status, h, _ = self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': reviewed_revision, 'Cookie': reviewer})
         self.assertEqual(status, 200)
         self.data['records'][0]['qty'] = 101
         self.assertEqual(self.request('PUT', '/api/inventory', json.dumps(self.data), {'X-GHG-Revision': h['X-GHG-Revision']})[0], 200)
@@ -230,7 +275,7 @@ class StorageTests(unittest.TestCase):
             {'id': '2024', 'company': '無活動資料年度'},
         ]
         self.data['records'] = [
-            {'month': '2025-01', 'sourceSnapshot': {'cat': 2}, 'amount': 0, 'status': '已審核'},
+            {'month': '2025-01', 'sourceSnapshot': {'cat': 2}, 'amount': 0, 'status': '待審核'},
             {'month': '2026-02', 'sourceSnapshot': {'cat': 3}, 'amount': 1.25},
             {'month': '2026-03', 'amount': 100},
         ]
@@ -246,7 +291,7 @@ class StorageTests(unittest.TestCase):
         self.assertNotIn('本年度甲公司', unconfigured)
         rows = json.loads(self.request('GET', '/api/annual-totals')[2])
         self.assertEqual([(r['year'], r['total'], r['pending'], r['invalid']) for r in rows],
-                         [('2024', None, 0, 0), ('2025', '0.0', 0, 0), ('2026', '1.25', 2, 1)])
+                         [('2024', None, 0, 0), ('2025', '0.0', 1, 0), ('2026', '1.25', 2, 1)])
         self.data['yearSettings'].append({'id': '2025'})
         self.assertEqual(self.request('PUT', '/api/inventory', json.dumps(self.data),
                          {'X-GHG-Revision': headers['X-GHG-Revision']})[0], 400)
