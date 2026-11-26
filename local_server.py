@@ -230,6 +230,10 @@ const localStore = {
         return self.reply(404, b"{}")
 
     def do_POST(self):
+        if self.path in ("/api/migrate-v1/preview", "/api/migrate-v1/apply"):
+            if not self.allowed() or self.headers.get("X-GHG-Token") != TOKEN:
+                return self.reply(403, b"{}")
+            return self.migrate_v1()
         if self.allowed() and self.headers.get("X-GHG-Token") == TOKEN and self.path == "/api/evidence/upload":
             return self.evidence_upload()
         if self.allowed() and self.headers.get("X-GHG-Token") == TOKEN and self.path in ("/api/backups/create", "/api/backups/restore"):
@@ -249,6 +253,46 @@ const localStore = {
             return self.reply(200, body, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         except (ValueError, TypeError, OSError, OverflowError) as e:
             return self.reply(400, json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
+
+    def migrate_v1(self):
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            if not 0 < size <= 20_000_000:
+                raise ValueError("請選擇 20 MB 以下的 V1 JSON 備份")
+            data = json.loads(self.rfile.read(size).decode("utf-8-sig"))
+            validate(data)
+            if set(data) != {"settings", *KEYS}:
+                raise ValueError("請使用 V1.0 的 JSON 備份")
+            if not re.fullmatch(r"[0-9]{4}", str(data["settings"].get("year", ""))):
+                raise ValueError("盤查年度格式不正確")
+            for key in KEYS:
+                ids = [item.get("id") for item in data[key]]
+                if any(not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", item) for item in ids):
+                    raise ValueError("舊版紀錄編號格式不正確")
+                if len(set(ids)) != len(ids):
+                    raise ValueError("備份中有重複的紀錄編號")
+            if any(type(item.get("cat")) is not int or not 1 <= item["cat"] <= 6 for item in data["sources"]):
+                raise ValueError("備份中有無效的排放類別")
+            if any(not isinstance(item.get("month"), str) for item in data["records"]):
+                raise ValueError("備份中有無效的活動月份")
+            payload = validate(data)
+            fingerprint = revision(payload)
+            with connect() as con:
+                if con.execute("SELECT 1 FROM inventory WHERE id=1").fetchone():
+                    return self.reply(409, '{"error":"移轉只能匯入尚未儲存資料的 V2 資料庫"}'.encode())
+                if self.path.endswith("/apply"):
+                    if self.headers.get("X-GHG-Import-Preview") != fingerprint:
+                        return self.reply(409, '{"error":"檔案與預覽不同，請重新預覽"}'.encode())
+                    con.execute("INSERT INTO inventory VALUES(1, ?)", (payload,))
+                    write_history(con, None, payload, "V1 資料移轉")
+            return self.reply(200, json.dumps({
+                "year": data["settings"]["year"], "counts": {key: len(data[key]) for key in KEYS},
+                "preview": fingerprint,
+            }).encode())
+        except (UnicodeError, ValueError, TypeError, RecursionError):
+            return self.reply(400, '{"error":"V1 備份格式或紀錄欄位不正確"}'.encode())
+        except (sqlite3.Error, OSError):
+            return self.reply(500, '{"error":"無法讀寫本機資料庫，移轉未完成"}'.encode())
 
     def evidence_upload(self):
         try:

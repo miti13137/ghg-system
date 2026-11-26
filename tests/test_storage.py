@@ -251,6 +251,25 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(self.request('PUT', '/api/inventory', json.dumps(self.data),
                          {'X-GHG-Revision': headers['X-GHG-Revision']})[0], 400)
 
+    def test_v1_migration_requires_matching_preview_and_never_overwrites(self):
+        self.data['sources'] = [{'id': 's1', 'cat': 2, 'name': '模擬用電'}]
+        self.data['records'] = [{'id': 'r1', 'month': '2026-01', 'amount': 3.5,
+                                 'status': '已審核', 'sourceSnapshot': self.data['sources'][0]}]
+        saved = json.dumps(self.data, ensure_ascii=False).encode('utf-8-sig')
+        status, _, body = self.request('POST', '/api/migrate-v1/preview', saved)
+        self.assertEqual(status, 200)
+        preview = json.loads(body)
+        self.assertEqual(preview['counts']['records'], 1)
+        self.assertEqual(self.request('GET', '/api/inventory')[2], b'null')
+        token = {'X-GHG-Import-Preview': preview['preview']}
+        self.data['records'][0]['amount'] = 99
+        self.assertEqual(self.request('POST', '/api/migrate-v1/apply', json.dumps(self.data), token)[0], 409)
+        self.assertEqual(self.request('POST', '/api/migrate-v1/apply', saved, token)[0], 200)
+        self.assertEqual(json.loads(self.request('GET', '/api/inventory')[2])['records'][0]['amount'], 3.5)
+        self.assertEqual(self.request('POST', '/api/migrate-v1/apply', saved, token)[0], 409)
+        events = json.loads(self.request('GET', '/api/history')[2])
+        self.assertTrue(any(event['reason'] == 'V1 資料移轉' for event in events))
+
     def test_offline_excel_endpoints(self):
         matrix = [['名稱', '數值'], ['模擬資料', '12']]
         status, headers, workbook = self.request('POST', '/api/xlsx/write', json.dumps(matrix).encode())
