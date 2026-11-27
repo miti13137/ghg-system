@@ -12,6 +12,7 @@ import webbrowser
 import xlsx_local
 import inventory_quality
 from annual_report import annual_report
+from verification_export import build_pack
 from local_auth import Accounts, LIFETIME
 from inventory_years import annual_totals, validate_year_settings
 from pathlib import Path
@@ -295,6 +296,9 @@ const localStore = {
                 row = con.execute("SELECT payload FROM inventory WHERE id=1").fetchone()
             totals = annual_totals(json.loads(row[0])) if row else []
             return self.reply(200, json.dumps(totals, ensure_ascii=False).encode("utf-8"))
+        pack = re.fullmatch(r"/api/verification-pack/([0-9]{4})", self.path)
+        if pack:
+            return self.verification_pack(pack.group(1))
         report = re.fullmatch(r"/api/report/([0-9]{4})", self.path)
         if report and self.headers.get("X-GHG-Token") == TOKEN:
             with connect() as con:
@@ -326,6 +330,27 @@ const localStore = {
             self.response_revision = revision(row[0] if row else None)
             return self.reply(200, (row[0] if row else "null").encode())
         return self.reply(404, b"{}")
+
+    def verification_pack(self, year):
+        try:
+            with connect() as con:
+                con.execute("BEGIN")
+                row = con.execute("SELECT payload FROM inventory WHERE id=1").fetchone()
+                if row is None:
+                    return self.json_reply(404, {"error": "請先儲存盤查資料。"})
+                def evidence_lookup(file_id):
+                    return con.execute("SELECT filename,sha256,content FROM evidence_files WHERE id=?",
+                                       (file_id,)).fetchone()
+                history = con.execute(
+                    "SELECT item_id,changed_at,actor,before_json,after_json,reason "
+                    "FROM change_history WHERE collection='records' ORDER BY id"
+                )
+                archive = build_pack(json.loads(row[0]), year, evidence_lookup, history)
+        except (ValueError, OverflowError) as error:
+            return self.json_reply(400, {"error": str(error)})
+        except (sqlite3.Error, OSError):
+            return self.json_reply(500, {"error": "無法讀取本機盤查資料。"})
+        return self.reply(200, archive, "application/zip")
 
     def do_POST(self):
         if not self.allowed() or self.headers.get("X-GHG-Token") != TOKEN:

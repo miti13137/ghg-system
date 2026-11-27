@@ -9,7 +9,7 @@ import tempfile
 SOURCE = Path(__file__).resolve().parent
 PROGRAM_FILES = (
     'Start-GHG.bat', 'local_server.py', 'index.html', 'xlsx_local.py',
-    'inventory_quality.py', 'annual_report.py', 'inventory_years.py', 'local_auth.py', 'login.html',
+    'inventory_quality.py', 'annual_report.py', 'inventory_years.py', 'local_auth.py', 'login.html', 'verification_export.py',
 )
 
 

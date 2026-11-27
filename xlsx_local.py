@@ -1,9 +1,10 @@
 """Limited offline XLSX reader/writer for GHG tabular imports; no dependencies."""
 import io
+import math
 import re
 import zipfile
 import xml.etree.ElementTree as ET
-from xml.sax.saxutils import escape
+from xml.sax.saxutils import escape, quoteattr
 
 MAX_FILE = 10_000_000
 MAX_UNPACKED = 40_000_000
@@ -97,24 +98,66 @@ def colname(i):
 
 
 def write_xlsx(matrix):
-    if not isinstance(matrix, list) or len(matrix) > MAX_ROWS: raise ValueError('列數超過限制')
+    return write_workbook([('資料', matrix)], presentation=False)
+
+
+def worksheet(matrix, presentation):
+    if not isinstance(matrix, list) or len(matrix) > (1_048_576 if presentation else MAX_ROWS):
+        raise ValueError('列數超過限制')
     rows = []
+    width = 0
     for i, row in enumerate(matrix, 1):
-        if not isinstance(row, list) or len(row) > MAX_COLS: raise ValueError('欄數超過限制')
+        if not isinstance(row, list) or len(row) > MAX_COLS:
+            raise ValueError('欄數超過限制')
+        width = max(width, len(row))
         cells = []
         for j, raw in enumerate(row, 1):
+            ref = f'{colname(j)}{i}'
+            if presentation and type(raw) in (int, float) and math.isfinite(raw):
+                cells.append(f'<c r="{ref}"><v>{raw}</v></c>')
+                continue
             value = str(raw if raw is not None else '')
-            if len(value) > MAX_CELL or any(ord(x) < 32 and x not in '\t\r\n' for x in value): raise ValueError('儲存格內容不正確')
-            cells.append(f'<c r="{colname(j)}{i}" t="inlineStr"><is><t xml:space="preserve">{escape(value)}</t></is></c>')
+            if presentation:
+                value = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff\ud800-\udfff]', '�', value)
+                if len(value) > 16000:
+                    value = value[:15985] + '（內容已截短）'
+            elif len(value) > MAX_CELL or any(ord(x) < 32 and x not in '\t\r\n' for x in value):
+                raise ValueError('儲存格內容不正確')
+            cells.append(f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{escape(value)}</t></is></c>')
         rows.append(f'<row r="{i}">{"".join(cells)}</row>')
-    files = {
-      '[Content_Types].xml': '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>',
-      '_rels/.rels': '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
-      'xl/workbook.xml': '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="資料" sheetId="1" r:id="rId1"/></sheets></workbook>',
-      'xl/_rels/workbook.xml.rels': '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>',
-      'xl/worksheets/sheet1.xml': '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' + ''.join(rows) + '</sheetData></worksheet>',
-    }
+    views = ''
+    filters = ''
+    if presentation and width:
+        views = ('<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
+                 'activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+                 f'<cols><col min="1" max="{width}" width="21" customWidth="1"/></cols>')
+        filters = f'<autoFilter ref="A1:{colname(width)}{len(rows)}"/>'
+    return f'<worksheet xmlns="{NS[1:-1]}">{views}<sheetData>{"".join(rows)}</sheetData>{filters}</worksheet>'
+
+
+def write_workbook(sheets, presentation=True):
     output = io.BytesIO()
-    with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as z:
-        for name, content in files.items(): z.writestr(name, content.encode('utf-8'))
+    content_ns = 'http://schemas.openxmlformats.org/package/2006/content-types'
+    relationship_ns = REL[1:-1]
+    package_ns = PKG_REL[1:-1]
+    entries, overrides, relationships = [], [], []
+    with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as archive:
+        for i, (name, matrix) in enumerate(sheets, 1):
+            path = f'worksheets/sheet{i}.xml'
+            entries.append(f'<sheet name={quoteattr(name)} sheetId="{i}" r:id="rId{i}"/>')
+            overrides.append(f'<Override PartName="/xl/{path}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
+            relationships.append(f'<Relationship Id="rId{i}" Type="{relationship_ns}/worksheet" Target="{path}"/>')
+            archive.writestr('xl/' + path, worksheet(matrix, presentation))
+        archive.writestr('[Content_Types].xml', f'<Types xmlns="{content_ns}">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            + ''.join(overrides) + '</Types>')
+        archive.writestr('_rels/.rels', f'<Relationships xmlns="{package_ns}">'
+            f'<Relationship Id="rId1" Type="{relationship_ns}/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+        archive.writestr('xl/workbook.xml', f'<workbook xmlns="{NS[1:-1]}" xmlns:r="{relationship_ns}">'
+            + ('<bookViews><workbookView/></bookViews>' if presentation else '')
+            + '<sheets>' + ''.join(entries) + '</sheets></workbook>')
+        archive.writestr('xl/_rels/workbook.xml.rels',
+                         f'<Relationships xmlns="{package_ns}">{"".join(relationships)}</Relationships>')
     return output.getvalue()

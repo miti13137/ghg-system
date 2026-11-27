@@ -221,6 +221,62 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(any(x['collection'] == 'records' and x['operation'] == '修改' and json.loads(x['before'])['qty'] == 100 and json.loads(x['after'])['qty'] == 101 for x in history))
         self.assertEqual(self.request('GET', '/api/history', headers={'X-GHG-Token':'bad'})[0], 404)
 
+    def test_verification_pack_scopes_data_and_links_original_evidence(self):
+        from io import BytesIO
+        from zipfile import ZipFile
+        import xml.etree.ElementTree as ET
+
+        self.data['records'] = [
+            {'id': 'selected', 'month': '2026-02', 'amount': 1.25, 'status': '待審核',
+             'sourceSnapshot': {'cat': 2}, 'factorSnapshot': {'origin': '模擬係數版本'}},
+            {'id': 'outside', 'month': '2025-02', 'amount': 99, 'status': '待審核'},
+        ]
+        self.data['evidence'] = [{'recordId': 'selected', 'name': '=1+1', 'location': '外部索引'}]
+        self.data['audit'] = [
+            {'record': 'selected', 'name': '年度查證事項'},
+            {'record': 'outside', 'name': '另一年度事項'},
+        ]
+        _, headers, _ = self.request('GET', '/api/inventory')
+        status, headers, _ = self.request('PUT', '/api/inventory', json.dumps(self.data),
+                                         {'X-GHG-Revision': headers['X-GHG-Revision']})
+        self.assertEqual(status, 200)
+        evidence = b'%PDF mock evidence'
+        upload = {'recordId': 'selected', 'name': '模擬佐證', 'note': '',
+                  'filename': 'mock.pdf', 'content': base64.b64encode(evidence).decode()}
+        status, headers, _ = self.request('POST', '/api/evidence/upload', json.dumps(upload),
+                                         {'X-GHG-Revision': headers['X-GHG-Revision']})
+        self.assertEqual(status, 200)
+        reviewer = self.create_user_cookie('reviewer')
+        self.data = json.loads(self.request('GET', '/api/inventory')[2])
+        self.data['records'][0]['status'] = '已審核'
+        status, _, _ = self.request('PUT', '/api/inventory', json.dumps(self.data),
+                                    {'X-GHG-Revision': headers['X-GHG-Revision'], 'Cookie': reviewer})
+        self.assertEqual(status, 200)
+        path = '/api/verification-pack/2026'
+        self.assertEqual(self.request('GET', path, headers={'Cookie': ''})[0], 404)
+        status, headers, raw = self.request('GET', path)
+        self.assertEqual((status, headers['Content-Type']), (200, 'application/zip'))
+        with ZipFile(BytesIO(raw)) as pack:
+            self.assertIsNone(pack.testzip())
+            original = next(name for name in pack.namelist() if name.startswith('evidence/'))
+            self.assertEqual(pack.read(original), evidence)
+            self.assertIn('2026 年溫室氣體盤查報告'.encode(), pack.read('GHG_2026_report-draft.html'))
+            workbook = pack.read('GHG_2026_verification.xlsx')
+        with ZipFile(BytesIO(workbook)) as book:
+            self.assertIsNone(book.testzip())
+            sheets = [book.read(name) for name in book.namelist() if name.startswith('xl/worksheets/')]
+            self.assertEqual(len(sheets), 9)
+            xml = b' '.join(sheets).decode()
+            for text in (original, '模擬係數版本', '年度查證事項', 'test-reviewer', '只有索引'):
+                self.assertIn(text, xml)
+            self.assertNotIn('outside', xml)
+            self.assertNotIn('另一年度事項', xml)
+            namespace = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+            root = ET.fromstring(book.read('xl/worksheets/sheet3.xml'))
+            self.assertEqual(root.find(".//" + namespace + "c[@r='R2']/" + namespace + 'v').text, '1.25')
+            for sheet in sheets:
+                self.assertEqual(list(ET.fromstring(sheet).iter(namespace + 'f')), [])
+
     def test_quality_check_endpoint(self):
         self.data['settings'] = {'year': 2026}
         self.data['records'] = [{'id':'mock','month':'invalid','qty':10}]
